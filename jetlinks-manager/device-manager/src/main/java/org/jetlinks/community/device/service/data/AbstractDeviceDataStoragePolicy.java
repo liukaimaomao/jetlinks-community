@@ -2,34 +2,29 @@ package org.jetlinks.community.device.service.data;
 
 import com.alibaba.fastjson.JSON;
 import com.google.common.collect.Maps;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.commons.collections.MapUtils;
 import org.hswebframework.ezorm.core.param.TermType;
 import org.hswebframework.web.api.crud.entity.PagerResult;
 import org.hswebframework.web.api.crud.entity.QueryParamEntity;
 import org.hswebframework.web.id.IDGenerator;
+import org.jetlinks.community.device.entity.DeviceEvent;
+import org.jetlinks.community.device.entity.DeviceOperationLogEntity;
+import org.jetlinks.community.device.entity.DeviceProperty;
+import org.jetlinks.community.device.enums.DeviceLogType;
+import org.jetlinks.community.device.events.handler.ValueTypeTranslator;
 import org.jetlinks.community.gateway.DeviceMessageUtils;
+import org.jetlinks.community.timeseries.TimeSeriesData;
 import org.jetlinks.core.device.DeviceConfigKey;
 import org.jetlinks.core.device.DeviceProductOperator;
 import org.jetlinks.core.device.DeviceRegistry;
 import org.jetlinks.core.message.DeviceLogMessage;
 import org.jetlinks.core.message.DeviceMessage;
-import org.jetlinks.core.message.DeviceMessageReply;
 import org.jetlinks.core.message.Headers;
 import org.jetlinks.core.message.event.EventMessage;
-import org.jetlinks.core.message.property.ReadPropertyMessageReply;
-import org.jetlinks.core.message.property.ReportPropertyMessage;
-import org.jetlinks.core.message.property.WritePropertyMessageReply;
 import org.jetlinks.core.metadata.*;
 import org.jetlinks.core.metadata.types.*;
-import org.jetlinks.community.device.entity.DeviceEvent;
-import org.jetlinks.community.device.entity.DeviceOperationLogEntity;
-import org.jetlinks.community.device.entity.DevicePropertiesEntity;
-import org.jetlinks.community.device.entity.DeviceProperty;
-import org.jetlinks.community.device.enums.DeviceLogType;
-import org.jetlinks.community.device.events.handler.ValueTypeTranslator;
-import org.jetlinks.community.device.timeseries.DeviceTimeSeriesMetric;
-import org.jetlinks.community.timeseries.TimeSeriesData;
 import org.jetlinks.core.utils.DeviceMessageTracer;
 import org.jetlinks.core.utils.TimestampUtils;
 import org.reactivestreams.Publisher;
@@ -43,8 +38,8 @@ import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
-import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 import static org.jetlinks.community.device.service.data.StorageConstants.propertyIsIgnoreStorage;
 import static org.jetlinks.community.device.service.data.StorageConstants.propertyIsJsonStringStorage;
@@ -56,10 +51,11 @@ import static org.jetlinks.community.device.timeseries.DeviceTimeSeriesMetric.*;
  * @author zhouhao
  * @since 1.5.0
  */
+@Slf4j
 public abstract class AbstractDeviceDataStoragePolicy implements DeviceDataStoragePolicy {
 
+    private final AtomicInteger nanoInc = new AtomicInteger();
     protected DeviceRegistry deviceRegistry;
-
     protected DeviceDataStorageProperties properties;
 
     public AbstractDeviceDataStoragePolicy(DeviceRegistry registry,
@@ -87,12 +83,14 @@ public abstract class AbstractDeviceDataStoragePolicy implements DeviceDataStora
     protected abstract Mono<Void> doSaveData(String metric, Flux<TimeSeriesData> data);
 
     /**
+     * 设备消息转换 二元组 {deviceId, tsData}
+     *
      * @param productId  产品ID
-     * @param message    原始消息
-     * @param properties 属性
+     * @param message    设备属性消息
+     * @param properties 物模型属性
      * @return 数据集合
-     * @see this#convertPropertiesForColumnPolicy(String, DeviceMessage, Map)
-     * @see this#convertPropertiesForRowPolicy(String, DeviceMessage, Map)
+     * @see AbstractDeviceDataStoragePolicy#convertPropertiesForColumnPolicy(String, DeviceMessage, Map)
+     * @see AbstractDeviceDataStoragePolicy#convertPropertiesForRowPolicy(String, DeviceMessage, Map)
      */
     protected abstract Flux<Tuple2<String, TimeSeriesData>> convertProperties(String productId,
                                                                               DeviceMessage message,
@@ -106,7 +104,15 @@ public abstract class AbstractDeviceDataStoragePolicy implements DeviceDataStora
                                                              QueryParamEntity paramEntity,
                                                              Function<TimeSeriesData, T> mapper);
 
-
+    /**
+     * 保存单个设备消息,为了提升性能,存储策略会对保存请求进行缓冲,达到一定条件后
+     * 再进行批量写出,具体由不同对存储策略实现。
+     * <p>
+     * 如果保存失败,在这里不会得到错误信息.
+     *
+     * @param message 设备消息
+     * @return void
+     */
     @Nonnull
     @Override
     public Mono<Void> saveDeviceMessage(@Nonnull DeviceMessage message) {
@@ -131,6 +137,14 @@ public abstract class AbstractDeviceDataStoragePolicy implements DeviceDataStora
         return DigestUtils.md5Hex(String.join("_", message.getDeviceId(), String.valueOf(createUniqueNanoTime(ts))));
     }
 
+    protected String getDeviceLogMetric(String productId) {
+        return deviceLogMetricId(productId);
+    }
+
+    protected String getDeviceEventMetric(String productId, String eventId) {
+        return deviceEventMetricId(productId, eventId);
+    }
+
     protected Mono<Tuple2<String, TimeSeriesData>> createDeviceMessageLog(String productId,
                                                                           DeviceMessage message,
                                                                           BiConsumer<DeviceMessage, DeviceOperationLogEntity> logEntityConsumer) {
@@ -151,6 +165,12 @@ public abstract class AbstractDeviceDataStoragePolicy implements DeviceDataStora
             .toSimpleMap())));
     }
 
+    /**
+     * 设备消息转换成时序数据 二元组 {deviceId, tsData}
+     *
+     * @param message 设备消息
+     * @return 二元组
+     */
     protected Flux<Tuple2<String, TimeSeriesData>> convertMessageToTimeSeriesData(DeviceMessage message) {
         boolean ignoreStorage = message.getHeaderOrDefault(Headers.ignoreStorage);
         boolean ignoreLog = message.getHeaderOrDefault(Headers.ignoreLog);
@@ -193,40 +213,56 @@ public abstract class AbstractDeviceDataStoragePolicy implements DeviceDataStora
         return Flux.merge(all);
     }
 
+    /**
+     * 事件消息转换成 二元组{deviceId, tsData}
+     *
+     * @param productId 产品ID
+     * @param message   事件消息
+     * @return 二元组
+     */
     protected Mono<Tuple2<String, TimeSeriesData>> convertEventMessageToTimeSeriesData(String productId, EventMessage message) {
 
         return deviceRegistry
-            .getDevice(message.getDeviceId())
-            .flatMap(device -> device
+            .getProduct(productId)
+            .flatMap(product -> product
                 .getMetadata()
-                .map(metadata -> {
-                    Object value = message.getData();
-                    DataType dataType = metadata
-                        .getEvent(message.getEvent())
-                        .map(EventMetadata::getType)
-                        .orElseGet(UnknownType::new);
-                    Object tempValue = ValueTypeTranslator.translator(value, dataType);
-                    Map<String, Object> data;
-                    if (tempValue instanceof Map) {
-                        @SuppressWarnings("all")
-                        Map<String, Object> mapValue = ((Map) tempValue);
-                        int size = mapValue.size();
-                        data = newMap(size);
-                        data.putAll(mapValue);
-                    } else {
-                        data = newMap(16);
-                        data.put("value", tempValue);
+                .<TimeSeriesData>handle((metadata, sink) -> {
+                    if (metadata.getEventOrNull(message.getEvent()) == null) {
+                        log.warn("产品[{}]物模型中未定义事件:{}", productId, message.getEvent());
+                        return;
                     }
-                    data.put("id", createDataId(message));
-                    data.put("deviceId", device.getDeviceId());
-                    data.put("createTime", System.currentTimeMillis());
-
-                    return TimeSeriesData.of(TimestampUtils.toMillis(message.getTimestamp()), data);
+                    Map<String, Object> data = createEventData(message, metadata);
+                    sink.next(TimeSeriesData.of(TimestampUtils.toMillis(message.getTimestamp()), data));
                 }))
-            .map(data -> Tuples.of(deviceEventMetricId(productId, message.getEvent()), data));
+            .map(data -> Tuples.of(getDeviceEventMetric(productId, message.getEvent()), data));
     }
 
+    protected Map<String, Object> createEventData(EventMessage message, DeviceMetadata metadata) {
+        Object value = message.getData();
+        DataType dataType = metadata
+            .getEvent(message.getEvent())
+            .map(EventMetadata::getType)
+            .orElseGet(UnknownType::new);
+        Object tempValue = ValueTypeTranslator.translator(value, dataType);
+        Map<String, Object> data;
+        if (tempValue instanceof Map) {
+            @SuppressWarnings("all")
+            Map<String, Object> mapValue = ((Map) tempValue);
+            int size = mapValue.size();
+            data = newMap(size);
+            data.putAll(mapValue);
+        } else {
+            data = newMap(16);
+            data.put("value", tempValue);
+        }
+        data.put("id", createDataId(message));
+        data.put("deviceId", message.getDeviceId());
+        data.put("createTime", System.currentTimeMillis());
 
+        return data;
+    }
+
+    @Override
     public Mono<PagerResult<DeviceOperationLogEntity>> queryDeviceMessageLog(@Nonnull String deviceId, @Nonnull QueryParamEntity entity) {
         return deviceRegistry
             .getDevice(deviceId)
@@ -238,7 +274,6 @@ public abstract class AbstractDeviceDataStoragePolicy implements DeviceDataStora
                 ))
             .defaultIfEmpty(PagerResult.empty());
     }
-
 
     @Nonnull
     @Override
@@ -382,12 +417,25 @@ public abstract class AbstractDeviceDataStoragePolicy implements DeviceDataStora
         return Maps.newHashMapWithExpectedSize(size);
     }
 
+    /**
+     * 设备消息转换 二元组{deviceId, tsData}
+     *
+     * @param productId  产品ID
+     * @param message    设备属性消息
+     * @param properties 物模型属性
+     * @return 数据集合
+     * @see this#convertPropertiesForColumnPolicy(String, DeviceMessage, Map)
+     * @see this#convertPropertiesForRowPolicy(String, DeviceMessage, Map)
+     */
     protected Flux<Tuple2<String, TimeSeriesData>> convertPropertiesForRowPolicy(String productId,
                                                                                  DeviceMessage message,
                                                                                  Map<String, Object> properties) {
         if (MapUtils.isEmpty(properties)) {
             return Flux.empty();
         }
+        Map<String, Long> propertySourceTimes = DeviceMessageUtils
+            .tryGetPropertySourceTimes(message)
+            .orElseGet(Collections::emptyMap);
         return this
             .deviceRegistry
             .getDevice(message.getDeviceId())
@@ -398,8 +446,8 @@ public abstract class AbstractDeviceDataStoragePolicy implements DeviceDataStora
                     .index()
                     .flatMap(entry -> {
                         String id;
-                        long ts = message.getTimestamp();
                         String property = entry.getT2().getKey();
+                        long ts = propertySourceTimes.getOrDefault(property, message.getTimestamp());
                         //忽略存在没有的属性和忽略存储的属性
                         PropertyMetadata propertyMetadata = metadata.getPropertyOrNull(property);
                         if (propertyMetadata == null || propertyIsIgnoreStorage(propertyMetadata)) {
@@ -511,10 +559,29 @@ public abstract class AbstractDeviceDataStoragePolicy implements DeviceDataStora
             .flatMap(product -> Mono.zip(Mono.just(product), product.getMetadata()));
     }
 
+    protected List<PropertyMetadata> getPropertyMetadata(DeviceMetadata metadata, String... properties) {
+        if (properties == null || properties.length == 0) {
+            return metadata.getProperties();
+        }
+        if (properties.length == 1) {
+            return metadata.getProperty(properties[0])
+                           .map(Arrays::asList)
+                           .orElseGet(Collections::emptyList);
+        }
+        Set<String> ids = new HashSet<>(Arrays.asList(properties));
+        return metadata
+            .getProperties()
+            .stream()
+            .filter(prop -> ids.isEmpty() || ids.contains(prop.getId()))
+            .collect(Collectors.toList());
+    }
 
-    private final AtomicInteger nanoInc = new AtomicInteger();
-
-    //将毫秒转为纳秒，努力让数据不重复
+    /**
+     * 将毫秒转为纳秒，努力让数据不重复
+     *
+     * @param millis 毫秒值
+     * @return 尽可能不会重复的long值
+     */
     protected long createUniqueNanoTime(long millis) {
         long nano = TimeUnit.MILLISECONDS.toNanos(millis);
 

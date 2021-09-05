@@ -60,7 +60,6 @@ import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.xcontent.*;
 import org.elasticsearch.index.VersionType;
 import org.elasticsearch.index.get.GetResult;
-import org.elasticsearch.index.mapper.MapperService;
 import org.elasticsearch.index.reindex.BulkByScrollResponse;
 import org.elasticsearch.index.reindex.DeleteByQueryRequest;
 import org.elasticsearch.index.seqno.SequenceNumbers;
@@ -111,12 +110,11 @@ import java.util.StringJoiner;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
-import static org.elasticsearch.rest.BaseRestHandler.INCLUDE_TYPE_NAME_PARAMETER;
 import static org.springframework.data.elasticsearch.client.util.RequestConverters.createContentType;
 
 @Slf4j
 public class DefaultReactiveElasticsearchClient implements ReactiveElasticsearchClient {
-    private final HostProvider hostProvider;
+    private final HostProvider<?> hostProvider;
     private final RequestCreator requestCreator;
     private Supplier<HttpHeaders> headersSupplier = () -> HttpHeaders.EMPTY;
 
@@ -964,7 +962,10 @@ public class DefaultReactiveElasticsearchClient implements ReactiveElasticsearch
     }
 
     Request convertGetIndexTemplateRequest(GetIndexTemplatesRequest getIndexTemplatesRequest) {
-        return new Request(HttpGet.METHOD_NAME, "/_template/" + String.join(",", getIndexTemplatesRequest.names()));
+        Request request= new Request(HttpGet.METHOD_NAME, "/_template/" + String.join(",", getIndexTemplatesRequest.names()));
+        Params params = new Params(request);
+        params.putParam("include_type_name", "true");
+        return request;
     }
 
     @Override

@@ -11,9 +11,11 @@ import org.hswebframework.web.logger.ReactiveLogger;
 import org.jetlinks.community.gateway.external.Message;
 import org.jetlinks.community.gateway.external.MessagingManager;
 import org.jetlinks.community.gateway.external.SubscribeRequest;
+import org.springframework.core.io.buffer.DataBufferFactory;
 import org.springframework.util.StringUtils;
 import org.springframework.web.reactive.socket.CloseStatus;
 import org.springframework.web.reactive.socket.WebSocketHandler;
+import org.springframework.web.reactive.socket.WebSocketMessage;
 import org.springframework.web.reactive.socket.WebSocketSession;
 import reactor.core.Disposable;
 import reactor.core.publisher.Mono;
@@ -23,9 +25,7 @@ import javax.annotation.Nonnull;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentSkipListSet;
 
 @AllArgsConstructor
 @Slf4j
@@ -64,8 +64,25 @@ public class WebSocketMessagingHandler implements WebSocketHandler {
                 .receive()
                 .doOnNext(message -> {
                     try {
+                        if (message.getType() == WebSocketMessage.Type.PONG) {
+                            return;
+                        }
+                        if (message.getType() == WebSocketMessage.Type.PING) {
+                            session
+                                .send(Mono.just(session.pongMessage(DataBufferFactory::allocateBuffer)))
+                                .subscribe();
+                            return;
+                        }
                         MessagingRequest request = JSON.parseObject(message.getPayloadAsText(), MessagingRequest.class);
-                        if (request == null || request.getType() == MessagingRequest.Type.ping) {
+                        if (request == null) {
+                            return;
+                        }
+                        if (request.getType() == MessagingRequest.Type.ping) {
+                            session
+                                .send(Mono.just(session.textMessage(JSON.toJSONString(
+                                    Message.pong(request.getId())
+                                ))))
+                                .subscribe();
                             return;
                         }
                         if (StringUtils.isEmpty(request.getId())) {
